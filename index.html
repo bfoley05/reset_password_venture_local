@@ -142,24 +142,15 @@
 
   <script type="module">
     /**
-     * Password reset from the iOS app uses PKCE. The default email link hits Supabase verify then
-     * redirects with ?code=… which needs a code verifier only stored on the phone — the browser
-     * never gets a session and getSession() can hang.
+     * Swift uses PKCE for resetPasswordForEmail. Default {{ .ConfirmationURL }} often redirects here
+     * with ?code=…; exchangeCodeForSession + getSession can deadlock in the browser (no code verifier).
      *
-     * Fix: In Supabase → Auth → Email Templates → Reset password, use a link that sends the user
-     * straight here with token_hash + type (see reset-password-email-supabase.html), e.g.:
+     * Supabase reset email must use:
      *   href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=recovery"
-     *
-     * This page also supports implicit-style redirects (#access_token=…) via setSession.
+     * See reset-password-email-supabase.html
      */
     const SUPABASE_URL = "https://aqjuqjxmsanrmcpmaroj.supabase.co";
     const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFxanVxanhtc2Fucm1jcG1hcm9qIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzNDY0MzksImV4cCI6MjA5MDkyMjQzOX0.xIohogrAEiXJf_pesu3UwUj59K26dpUzN6gZ_hdthxM";
-
-    const { createClient } = await import("https://esm.sh/@supabase/supabase-js@2.49.1");
-    const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-      // We parse the URL explicitly (token_hash / hash tokens / ?code) to avoid PKCE deadlocks with Swift-initiated resets.
-      auth: { detectSessionInUrl: false, persistSession: false },
-    });
 
     const loading = document.getElementById("loading");
     const form = document.getElementById("form");
@@ -176,6 +167,15 @@
       msg.textContent = text;
     }
 
+    function withTimeout(promise, ms, label) {
+      return Promise.race([
+        promise,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(label || "Request timed out")), ms)
+        ),
+      ]);
+    }
+
     function stripAuthFromUrl() {
       const u = new URL(window.location.href);
       u.searchParams.delete("token_hash");
@@ -185,20 +185,37 @@
       window.history.replaceState({}, "", u.pathname + u.search + u.hash);
     }
 
-    async function establishRecoverySession() {
+    /**
+     * Never call exchangeCodeForSession here (can hang forever without PKCE verifier).
+     * Avoid getSession() when the URL has no auth hints (also known to hang in some builds).
+     */
+    async function establishRecoverySession(supabase) {
       try {
         const url = new URL(window.location.href);
         const tokenHash = url.searchParams.get("token_hash");
         const type = url.searchParams.get("type");
 
+        if (url.searchParams.get("code")) {
+          return {
+            error: new Error(
+              "This link still uses Supabase's old redirect (?code in the address) and cannot complete in the browser. In the dashboard: Authentication → Email Templates → Reset password — set the reset button URL to your Vercel page using token_hash and type=recovery (see Venture Local's reset-password-email-supabase.html). Then request a new reset from the app."
+            ),
+          };
+        }
+
         if (tokenHash && type) {
-          const { error } = await supabase.auth.verifyOtp({
-            type,
-            token_hash: tokenHash,
-          });
+          const { data, error } = await withTimeout(
+            supabase.auth.verifyOtp({ type, token_hash: tokenHash }),
+            25000,
+            "Could not reach Supabase. Check your connection."
+          );
           if (error) return { error };
           stripAuthFromUrl();
-          return { error: null };
+          return { error: null, session: data.session };
+        }
+
+        if (tokenHash && !type) {
+          return { error: new Error("Invalid reset link (missing type=recovery). Use the link from a new reset email.") };
         }
 
         const hashParams = new URLSearchParams(
@@ -207,32 +224,20 @@
         const accessToken = hashParams.get("access_token");
         const refreshToken = hashParams.get("refresh_token");
         if (accessToken && refreshToken) {
-          const { error } = await supabase.auth.setSession({
-            access_token: accessToken,
-            refresh_token: refreshToken,
-          });
+          const { data, error } = await withTimeout(
+            supabase.auth.setSession({
+              access_token: accessToken,
+              refresh_token: refreshToken,
+            }),
+            25000,
+            "Could not reach Supabase. Check your connection."
+          );
           if (error) return { error };
           stripAuthFromUrl();
-          return { error: null };
+          return { error: null, session: data.session };
         }
 
-        const code = url.searchParams.get("code");
-        if (code) {
-          const { error } = await supabase.auth.exchangeCodeForSession(window.location.href);
-          if (!error) {
-            stripAuthFromUrl();
-            return { error: null };
-          }
-          return {
-            error: new Error(
-              "This reset link can't complete in the browser (mobile app + email). Request a new reset email after updating the template—see Venture Local reset page instructions—or open the link on the same device where you tapped “Forgot password.”"
-            ),
-          };
-        }
-
-        const { error } = await supabase.auth.getSession();
-        if (error) return { error };
-        return { error: null };
+        return { error: null, session: null, bareVisit: true };
       } catch (e) {
         return { error: e instanceof Error ? e : new Error(String(e)) };
       }
@@ -243,26 +248,73 @@
         "This page still has placeholder credentials. Edit SUPABASE_URL and SUPABASE_ANON_KEY in this file, then redeploy.";
       loading.style.color = "#7a1f2a";
     } else {
-      const est = await establishRecoverySession();
-      if (est.error) {
+      let supabase;
+      try {
+        const cdn =
+          "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/+esm";
+        const cdnFallback = "https://esm.sh/@supabase/supabase-js@2.49.1";
+        let mod;
+        try {
+          mod = await withTimeout(
+            import(cdn),
+            15000,
+            "Primary script host timed out."
+          );
+        } catch {
+          mod = await withTimeout(
+            import(cdnFallback),
+            15000,
+            "Could not load reset tools. Try Wi‑Fi, another browser, or turn off content blockers."
+          );
+        }
+        supabase = mod.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+          auth: { detectSessionInUrl: false, persistSession: false },
+        });
+      } catch (e) {
         loading.classList.add("hidden");
-        showError(est.error.message || String(est.error));
+        showError(e instanceof Error ? e.message : String(e));
         return;
       }
 
-      const { data: { session }, error: sessErr } = await supabase.auth.getSession();
-      loading.classList.add("hidden");
-      if (sessErr) {
-        showError(sessErr.message);
-        return;
-      }
-      if (!session) {
+      const est = await establishRecoverySession(supabase);
+      if (est.error) {
+        loading.classList.add("hidden");
+        showError(est.error.message || String(est.error));
+      } else if (est.bareVisit) {
+        loading.classList.add("hidden");
         showError(
-          "This link is invalid or has expired. Request a new reset from the Venture Local app."
+          "Open this page using the link in your password reset email (it should contain token_hash in the address). If you only opened the site homepage, go back to the app and tap Forgot password again after fixing the email template."
         );
-        return;
+      } else {
+        let session = est.session;
+        if (!session) {
+          try {
+            const { data, error: sessErr } = await withTimeout(
+              supabase.auth.getSession(),
+              12000,
+              "Signing you in is taking too long. Try again or request a new reset email."
+            );
+            if (sessErr) {
+              loading.classList.add("hidden");
+              showError(sessErr.message);
+              return;
+            }
+            session = data.session;
+          } catch (e) {
+            loading.classList.add("hidden");
+            showError(e instanceof Error ? e.message : String(e));
+            return;
+          }
+        }
+        loading.classList.add("hidden");
+        if (!session) {
+          showError(
+            "This link is invalid or has expired. Request a new reset from the Venture Local app."
+          );
+        } else {
+          form.classList.remove("hidden");
+        }
       }
-      form.classList.remove("hidden");
 
       form.addEventListener("submit", async (e) => {
         e.preventDefault();
