@@ -140,17 +140,11 @@
     <p id="done" class="hint hidden">You can close this page and sign in again in the Venture Local app.</p>
   </div>
 
-  <script type="module">
-    /**
-     * Swift uses PKCE for resetPasswordForEmail. Default {{ .ConfirmationURL }} often redirects here
-     * with ?code=…; exchangeCodeForSession + getSession can deadlock in the browser (no code verifier).
-     *
-     * Supabase reset email must use:
-     *   href="{{ .RedirectTo }}?token_hash={{ .TokenHash }}&type=recovery"
-     * See reset-password-email-supabase.html
-     */
+  <script>
+    // Direct GoTrue API flow (no SDK import) to avoid browser PKCE/session deadlocks.
     const SUPABASE_URL = "https://aqjuqjxmsanrmcpmaroj.supabase.co";
     const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFxanVxanhtc2Fucm1jcG1hcm9qIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzNDY0MzksImV4cCI6MjA5MDkyMjQzOX0.xIohogrAEiXJf_pesu3UwUj59K26dpUzN6gZ_hdthxM";
+
 
     const loading = document.getElementById("loading");
     const form = document.getElementById("form");
@@ -158,21 +152,28 @@
     const done = document.getElementById("done");
     const btn = document.getElementById("btn");
 
+    let accessToken = null;
+
     function showError(text) {
       msg.className = "msg err";
       msg.textContent = text;
     }
+
     function showOk(text) {
       msg.className = "msg ok";
       msg.textContent = text;
     }
 
-    function withTimeout(promise, ms, label) {
+    function hideLoading() {
+      loading.classList.add("hidden");
+    }
+
+    function withTimeout(promise, ms, message) {
       return Promise.race([
         promise,
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error(label || "Request timed out")), ms)
-        ),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error(message || "Request timed out.")), ms);
+        }),
       ]);
     }
 
@@ -185,163 +186,119 @@
       window.history.replaceState({}, "", u.pathname + u.search + u.hash);
     }
 
-    /**
-     * Never call exchangeCodeForSession here (can hang forever without PKCE verifier).
-     * Avoid getSession() when the URL has no auth hints (also known to hang in some builds).
-     */
-    async function establishRecoverySession(supabase) {
-      try {
-        const url = new URL(window.location.href);
-        const tokenHash = url.searchParams.get("token_hash");
-        const type = url.searchParams.get("type");
+    async function verifyRecoveryToken() {
+      const url = new URL(window.location.href);
+      const tokenHash = url.searchParams.get("token_hash");
+      const type = url.searchParams.get("type");
 
-        if (url.searchParams.get("code")) {
-          return {
-            error: new Error(
-              "This link still uses Supabase's old redirect (?code in the address) and cannot complete in the browser. In the dashboard: Authentication → Email Templates → Reset password — set the reset button URL to your Vercel page using token_hash and type=recovery (see Venture Local's reset-password-email-supabase.html). Then request a new reset from the app."
-            ),
-          };
-        }
+      if (!tokenHash) {
+        throw new Error("Open this page from your reset email link. Missing token_hash.");
+      }
+      if (type !== "recovery") {
+        throw new Error("Invalid reset link type. Please request a new password reset email.");
+      }
 
-        if (tokenHash && type) {
-          const { data, error } = await withTimeout(
-            supabase.auth.verifyOtp({ type, token_hash: tokenHash }),
-            25000,
-            "Could not reach Supabase. Check your connection."
-          );
-          if (error) return { error };
-          stripAuthFromUrl();
-          return { error: null, session: data.session };
-        }
+      const verifyURL = SUPABASE_URL.replace(/\/$/, "") + "/auth/v1/verify";
+      const response = await withTimeout(
+        fetch(verifyURL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            apikey: SUPABASE_ANON_KEY,
+          },
+          body: JSON.stringify({
+            token_hash: tokenHash,
+            type: "recovery",
+          }),
+        }),
+        20000,
+        "Timed out while validating reset link. Try again."
+      );
 
-        if (tokenHash && !type) {
-          return { error: new Error("Invalid reset link (missing type=recovery). Use the link from a new reset email.") };
-        }
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.msg || payload.error_description || payload.error || "Reset link validation failed.");
+      }
 
-        const hashParams = new URLSearchParams(
-          window.location.hash.startsWith("#") ? window.location.hash.slice(1) : ""
-        );
-        const accessToken = hashParams.get("access_token");
-        const refreshToken = hashParams.get("refresh_token");
-        if (accessToken && refreshToken) {
-          const { data, error } = await withTimeout(
-            supabase.auth.setSession({
-              access_token: accessToken,
-              refresh_token: refreshToken,
-            }),
-            25000,
-            "Could not reach Supabase. Check your connection."
-          );
-          if (error) return { error };
-          stripAuthFromUrl();
-          return { error: null, session: data.session };
-        }
+      accessToken = payload.access_token || (payload.session && payload.session.access_token) || null;
+      if (!accessToken) {
+        throw new Error("Reset link validated but no session token was returned.");
+      }
 
-        return { error: null, session: null, bareVisit: true };
-      } catch (e) {
-        return { error: e instanceof Error ? e : new Error(String(e)) };
+      stripAuthFromUrl();
+    }
+
+    async function updatePassword(newPassword) {
+      const userURL = SUPABASE_URL.replace(/\/$/, "") + "/auth/v1/user";
+      const response = await withTimeout(
+        fetch(userURL, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: "Bearer " + accessToken,
+          },
+          body: JSON.stringify({ password: newPassword }),
+        }),
+        20000,
+        "Timed out while updating password. Try again."
+      );
+
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(payload.msg || payload.error_description || payload.error || "Could not update password.");
       }
     }
 
-    if (SUPABASE_URL.includes("REPLACE_") || SUPABASE_ANON_KEY.includes("REPLACE_")) {
-      loading.textContent =
-        "This page still has placeholder credentials. Edit SUPABASE_URL and SUPABASE_ANON_KEY in this file, then redeploy.";
-      loading.style.color = "#7a1f2a";
-    } else {
-      let supabase;
-      try {
-        const cdn =
-          "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/+esm";
-        const cdnFallback = "https://esm.sh/@supabase/supabase-js@2.49.1";
-        let mod;
-        try {
-          mod = await withTimeout(
-            import(cdn),
-            15000,
-            "Primary script host timed out."
-          );
-        } catch {
-          mod = await withTimeout(
-            import(cdnFallback),
-            15000,
-            "Could not load reset tools. Try Wi‑Fi, another browser, or turn off content blockers."
-          );
-        }
-        supabase = mod.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-          auth: { detectSessionInUrl: false, persistSession: false },
-        });
-      } catch (e) {
-        loading.classList.add("hidden");
-        showError(e instanceof Error ? e.message : String(e));
+    async function init() {
+      if (SUPABASE_URL.includes("REPLACE_") || SUPABASE_ANON_KEY.includes("REPLACE_")) {
+        loading.textContent =
+          "This page still has placeholder credentials. Edit SUPABASE_URL and SUPABASE_ANON_KEY in this file, then redeploy.";
+        loading.style.color = "#7a1f2a";
         return;
       }
 
-      const est = await establishRecoverySession(supabase);
-      if (est.error) {
-        loading.classList.add("hidden");
-        showError(est.error.message || String(est.error));
-      } else if (est.bareVisit) {
-        loading.classList.add("hidden");
-        showError(
-          "Open this page using the link in your password reset email (it should contain token_hash in the address). If you only opened the site homepage, go back to the app and tap Forgot password again after fixing the email template."
-        );
-      } else {
-        let session = est.session;
-        if (!session) {
-          try {
-            const { data, error: sessErr } = await withTimeout(
-              supabase.auth.getSession(),
-              12000,
-              "Signing you in is taking too long. Try again or request a new reset email."
-            );
-            if (sessErr) {
-              loading.classList.add("hidden");
-              showError(sessErr.message);
-              return;
-            }
-            session = data.session;
-          } catch (e) {
-            loading.classList.add("hidden");
-            showError(e instanceof Error ? e.message : String(e));
-            return;
-          }
-        }
-        loading.classList.add("hidden");
-        if (!session) {
-          showError(
-            "This link is invalid or has expired. Request a new reset from the Venture Local app."
-          );
-        } else {
-          form.classList.remove("hidden");
-        }
+      try {
+        await verifyRecoveryToken();
+        hideLoading();
+        form.classList.remove("hidden");
+      } catch (error) {
+        hideLoading();
+        showError(error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const p1 = document.getElementById("p1").value;
+      const p2 = document.getElementById("p2").value;
+      if (p1 !== p2) {
+        showError("Passwords do not match.");
+        return;
+      }
+      if (p1.length < 8) {
+        showError("Use at least 8 characters.");
+        return;
+      }
+      if (!accessToken) {
+        showError("Missing recovery session. Open a fresh reset link from your email.");
+        return;
       }
 
-      form.addEventListener("submit", async (e) => {
-        e.preventDefault();
-        const p1 = document.getElementById("p1").value;
-        const p2 = document.getElementById("p2").value;
-        if (p1 !== p2) {
-          showError("Passwords do not match.");
-          return;
-        }
-        if (p1.length < 8) {
-          showError("Use at least 8 characters.");
-          return;
-        }
-        btn.disabled = true;
-        const { error: upErr } = await supabase.auth.updateUser({ password: p1 });
-        btn.disabled = false;
-        if (upErr) {
-          showError(upErr.message);
-          return;
-        }
+      btn.disabled = true;
+      try {
+        await updatePassword(p1);
         form.classList.add("hidden");
-        msg.className = "msg ok";
-        msg.textContent = "Password updated successfully.";
+        showOk("Password updated successfully.");
         done.classList.remove("hidden");
-        await supabase.auth.signOut();
-      });
-    }
+      } catch (error) {
+        showError(error instanceof Error ? error.message : String(error));
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    init();
   </script>
 </body>
 </html>
